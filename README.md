@@ -73,6 +73,45 @@ curl -X POST http://localhost:3001/downloads/add \
 # → { "total": 36 }
 ```
 
+### `GET /downloads/stats` ✅ PÚBLICO
+Obtiene desglose de descargas por SO (Sistema Operativo).
+
+```bash
+curl http://localhost:3001/downloads/stats
+# → {
+#   "total": 31,
+#   "windows": 15,
+#   "macos": 10,
+#   "linux": 0,
+#   "totalByOS": 25
+# }
+```
+
+El `total` es el contador global. `totalByOS` es la suma por SO (count + offset).
+
+### `POST /downloads/stats/init` 🔒 PRIVADO
+Inicializa los offsets por SO (historial perdido). **Solo desde la app web con auth.**
+
+```bash
+curl -X POST http://localhost:3001/downloads/stats/init \
+  -H "Origin: https://kayser-fawn.vercel.app" \
+  -H "X-API-Key: kayser-downloads-secret-2024" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "windows": 13,
+    "macos": 7,
+    "linux": 0
+  }'
+# → {
+#   "message": "Offsets initialized",
+#   "windows": 13,
+#   "macos": 7,
+#   "linux": 0
+# }
+```
+
+**Importante:** Los offsets se guardan en SQLite y **PERSISTEN** aunque reinicies el servidor.
+
 ### `GET /health` ✅ PÚBLICO
 Verifica que el servidor está vivo.
 

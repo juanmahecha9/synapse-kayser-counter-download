@@ -72,11 +72,12 @@ function initializeDB() {
     if (err) console.error('❌ Error creando tabla downloads:', err);
   });
 
-  // Tabla de estadísticas por SO
+  // Tabla de estadísticas por SO (con offset para historial)
   db.run(`
     CREATE TABLE IF NOT EXISTS downloads_by_os (
       os TEXT PRIMARY KEY,
-      count INTEGER NOT NULL DEFAULT 0
+      count INTEGER NOT NULL DEFAULT 0,
+      offset INTEGER NOT NULL DEFAULT 0
     );
   `, (err) => {
     if (err) console.error('❌ Error creando tabla downloads_by_os:', err);
@@ -115,9 +116,9 @@ app.get('/downloads', (req, res) => {
   });
 });
 
-// GET /downloads/stats - obtener desglose por SO
+// GET /downloads/stats - obtener desglose por SO (con offset)
 app.get('/downloads/stats', (req, res) => {
-  db.all('SELECT os, count FROM downloads_by_os ORDER BY count DESC', (err, rows) => {
+  db.all('SELECT os, count, offset FROM downloads_by_os ORDER BY (count + offset) DESC', (err, rows) => {
     if (err) {
       console.error('❌ Error en GET /downloads/stats:', err);
       return res.status(500).json({ error: 'Database error' });
@@ -127,8 +128,11 @@ app.get('/downloads/stats', (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
 
       const stats = {};
+      let totalFromStats = 0;
       (rows || []).forEach((row) => {
-        stats[row.os.toLowerCase()] = row.count;
+        const total = row.count + row.offset;
+        stats[row.os.toLowerCase()] = total;
+        totalFromStats += total;
       });
 
       res.json({
@@ -136,7 +140,45 @@ app.get('/downloads/stats', (req, res) => {
         windows: stats.windows || 0,
         macos: stats.macos || 0,
         linux: stats.linux || 0,
+        totalByOS: totalFromStats,
         stats: stats,
+      });
+    });
+  });
+});
+
+// POST /downloads/stats/init - inicializar offsets por SO
+app.post('/downloads/stats/init', verifyAuth, (req, res) => {
+  const { windows = 0, macos = 0, linux = 0 } = req.body;
+
+  console.log(`[INIT STATS] Windows: ${windows}, macOS: ${macos}, Linux: ${linux}`);
+
+  // Actualizar offsets (se guardan permanentemente en SQLite)
+  db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [windows, 'Windows'], (err) => {
+    if (err) {
+      console.error('❌ Error actualizando Windows offset:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [macos, 'macOS'], (err) => {
+      if (err) {
+        console.error('❌ Error actualizando macOS offset:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [linux, 'Linux'], (err) => {
+        if (err) {
+          console.error('❌ Error actualizando Linux offset:', err);
+          return res.status(500).json({ error: 'Database error' });
+        }
+
+        console.log(`✅ Offsets inicializados: Windows=${windows}, macOS=${macos}, Linux=${linux}`);
+        res.json({
+          message: 'Offsets initialized',
+          windows,
+          macos,
+          linux,
+        });
       });
     });
   });
