@@ -222,6 +222,28 @@ X-API-Key: wrong-key
 
 **Solo** la app en `https://kayser-fawn.vercel.app` con el `X-API-Key` correcto puede escribir datos.
 
+## 🔗 Integración con Frontend (Synapse)
+
+El frontend de Synapse está configurado para llamar a este backend:
+
+```javascript
+// src/scripts/main.js
+const BACKEND_URL = window.__DOWNLOADS_BACKEND_URL__; // http://localhost:3001
+const apiKey = window.__DOWNLOADS_API_KEY__;
+
+// GET /downloads (solo lectura, públic)
+const response = await fetch(`${BACKEND_URL}/downloads`);
+const { total } = await response.json();
+
+// Mostrar en página
+document.getElementById("dl-github-downloads").textContent = total;
+```
+
+**Variables de entorno:**
+- `src/release/releases.ts`: define `downloadsBackendUrl` y `downloadsBackendApiKey`
+- `.env.local`: overrides para desarrollo (localhost:3001)
+- `Vercel`: Environment Variables para producción
+
 ## 📄 Licencia
 
 Gamma & Omega
