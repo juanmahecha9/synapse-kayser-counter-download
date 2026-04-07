@@ -60,24 +60,47 @@ const db = new sqlite3.Database(dbPath, (err) => {
   }
 });
 
-// Initialize table
+// Initialize tables
 function initializeDB() {
+  // Tabla de totales
   db.run(`
     CREATE TABLE IF NOT EXISTS downloads (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       total INTEGER NOT NULL DEFAULT 0
     );
   `, (err) => {
-    if (err) console.error('❌ Error creando tabla:', err);
+    if (err) console.error('❌ Error creando tabla downloads:', err);
   });
 
-  // Ensure we have one row
+  // Tabla de estadísticas por SO
+  db.run(`
+    CREATE TABLE IF NOT EXISTS downloads_by_os (
+      os TEXT PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 0
+    );
+  `, (err) => {
+    if (err) console.error('❌ Error creando tabla downloads_by_os:', err);
+  });
+
+  // Ensure we have one row en downloads
   db.get('SELECT * FROM downloads WHERE id = 1', (err, row) => {
     if (!row) {
       db.run('INSERT INTO downloads (id, total) VALUES (1, 0)', (err) => {
         if (err) console.error('❌ Error insertando fila inicial:', err);
       });
     }
+  });
+
+  // Inicializar SO si no existen
+  const systems = ['Windows', 'macOS', 'Linux'];
+  systems.forEach((os) => {
+    db.get('SELECT * FROM downloads_by_os WHERE os = ?', [os], (err, row) => {
+      if (!row) {
+        db.run('INSERT INTO downloads_by_os (os, count) VALUES (?, 0)', [os], (err) => {
+          if (err) console.error(`❌ Error insertando ${os}:`, err);
+        });
+      }
+    });
   });
 }
 
@@ -92,17 +115,58 @@ app.get('/downloads', (req, res) => {
   });
 });
 
-// POST /downloads/increment - sumar 1
+// GET /downloads/stats - obtener desglose por SO
+app.get('/downloads/stats', (req, res) => {
+  db.all('SELECT os, count FROM downloads_by_os ORDER BY count DESC', (err, rows) => {
+    if (err) {
+      console.error('❌ Error en GET /downloads/stats:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    db.get('SELECT total FROM downloads WHERE id = 1', (err, totalRow) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+
+      const stats = {};
+      (rows || []).forEach((row) => {
+        stats[row.os.toLowerCase()] = row.count;
+      });
+
+      res.json({
+        total: totalRow?.total || 0,
+        windows: stats.windows || 0,
+        macos: stats.macos || 0,
+        linux: stats.linux || 0,
+        stats: stats,
+      });
+    });
+  });
+});
+
+// POST /downloads/increment - sumar 1 (con estadísticas por SO)
 app.post('/downloads/increment', verifyAuth, (req, res) => {
+  const { os } = req.body;
+  const osLabel = os || 'Unknown';
+
+  // Actualizar total global
   db.run('UPDATE downloads SET total = total + 1 WHERE id = 1', (err) => {
     if (err) {
       console.error('❌ Error en POST /downloads/increment:', err);
       return res.status(500).json({ error: 'Database error' });
     }
-    db.get('SELECT total FROM downloads WHERE id = 1', (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      console.log(`✅ Incrementado: ${row.total} (desde ${req.headers['origin']})`);
-      res.json({ total: row.total });
+
+    // Actualizar conteo por SO
+    db.run('UPDATE downloads_by_os SET count = count + 1 WHERE os = ?', [osLabel], (err) => {
+      if (err) {
+        console.error('❌ Error actualizando SO:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      // Obtener totales actualizados
+      db.get('SELECT total FROM downloads WHERE id = 1', (err, row) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        console.log(`✅ Incrementado: ${row.total} (${osLabel}) desde ${req.headers['origin']}`);
+        res.json({ total: row.total, os: osLabel });
+      });
     });
   });
 });
