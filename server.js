@@ -1,279 +1,143 @@
 import express from 'express';
-import sqlite3 from 'sqlite3';
 import cors from 'cors';
-import path from 'path';
-import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
-
-// Configuración de seguridad
-const ALLOWED_ORIGIN = 'https://kayser-fawn.vercel.app';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://kayser-fawn.vercel.app';
 const API_SECRET = process.env.API_SECRET || 'kayser-downloads-secret-2024';
 
-// CORS básico (EXPRESS lo maneja, pero la autenticación real es en el middleware)
 app.use(cors());
 app.use(express.json());
 
-// Middleware de autenticación para operaciones de escritura
+// ── Storage ───────────────────────────────────────────────────────────────────
+// Uses Vercel KV (Redis) in production; falls back to in-memory for local dev.
+const hasKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+let _store = null;
+
+async function storage() {
+  if (_store) return _store;
+
+  if (hasKV) {
+    const { kv } = await import('@vercel/kv');
+    _store = {
+      get: (k) => kv.get(k),
+      incr: (k) => kv.incr(k),
+      set: (k, v) => kv.set(k, v),
+    };
+    console.log('✅ Usando Vercel KV (Redis)');
+  } else {
+    console.warn('⚠ KV_REST_API_URL/KV_REST_API_TOKEN no definidos — usando almacenamiento en memoria (los datos se pierden al reiniciar)');
+    const mem = new Map();
+    _store = {
+      get: async (k) => mem.get(k) ?? 0,
+      incr: async (k) => {
+        const v = (mem.get(k) ?? 0) + 1;
+        mem.set(k, v);
+        return v;
+      },
+      set: async (k, v) => { mem.set(k, v); },
+    };
+  }
+
+  return _store;
+}
+
+// ── Auth middleware ────────────────────────────────────────────────────────────
 function verifyAuth(req, res, next) {
-  // GET es público (solo lectura)
-  if (req.method === 'GET') {
-    return next();
-  }
+  if (req.method === 'GET') return next();
 
-  // POST requiere validación ESTRICTA
-  const authHeader = req.headers['x-api-key'];
   const origin = req.headers['origin'];
+  const apiKey = req.headers['x-api-key'];
 
-  console.log(`[AUTH] ${req.method} ${req.path} | Origin: ${origin} | API-Key: ${authHeader ? '***' : 'MISSING'}`);
+  console.log(`[AUTH] ${req.method} ${req.path} | origin=${origin}`);
 
-  // Verificar que venga de la app web (ESTRICTO)
   if (origin !== ALLOWED_ORIGIN) {
-    console.log(`[BLOCKED] ❌ Origin inválido: ${origin}`);
-    return res.status(403).json({
-      error: 'Acceso denegado: origen no permitido',
-      received: origin,
-      expected: ALLOWED_ORIGIN
-    });
+    console.warn(`[BLOCKED] origin no permitido: ${origin}`);
+    return res.status(403).json({ error: 'Origin no permitido', received: origin });
   }
-
-  // Verificar API key (ESTRICTO)
-  if (!authHeader || authHeader !== API_SECRET) {
-    console.log(`[BLOCKED] ❌ API key inválida o missing`);
+  if (!apiKey || apiKey !== API_SECRET) {
+    console.warn('[BLOCKED] API key inválida');
     return res.status(401).json({ error: 'API key inválida' });
   }
 
-  console.log(`[ALLOWED] ✅ Autenticado desde ${origin}`);
   next();
 }
 
-// Database setup
-const dbPath = path.join(__dirname, 'downloads.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('❌ Error abriendo base de datos:', err);
-  } else {
-    console.log('✅ Base de datos conectada');
-    initializeDB();
+app.use(verifyAuth);
+
+// ── Endpoints ─────────────────────────────────────────────────────────────────
+
+// GET /health  — public
+app.get('/health', async (_req, res) => {
+  res.json({ status: 'ok', storage: hasKV ? 'vercel-kv' : 'in-memory' });
+});
+
+// GET /downloads  — public, devuelve total acumulado
+app.get('/downloads', async (req, res) => {
+  try {
+    const store = await storage();
+    const total = (await store.get('downloads:total')) ?? 0;
+    res.json({ total: Number(total) });
+  } catch (err) {
+    console.error('[GET /downloads]', err);
+    res.status(500).json({ error: 'Error de almacenamiento' });
   }
 });
 
-// Initialize tables
-function initializeDB() {
-  // Tabla de totales
-  db.run(`
-    CREATE TABLE IF NOT EXISTS downloads (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      total INTEGER NOT NULL DEFAULT 0
-    );
-  `, (err) => {
-    if (err) console.error('❌ Error creando tabla downloads:', err);
-  });
-
-  // Tabla de estadísticas por SO (con offset para historial)
-  db.run(`
-    CREATE TABLE IF NOT EXISTS downloads_by_os (
-      os TEXT PRIMARY KEY,
-      count INTEGER NOT NULL DEFAULT 0,
-      offset INTEGER NOT NULL DEFAULT 0
-    );
-  `, (err) => {
-    if (err) console.error('❌ Error creando tabla downloads_by_os:', err);
-  });
-
-  // Ensure we have one row en downloads
-  db.get('SELECT * FROM downloads WHERE id = 1', (err, row) => {
-    if (!row) {
-      db.run('INSERT INTO downloads (id, total) VALUES (1, 0)', (err) => {
-        if (err) console.error('❌ Error insertando fila inicial:', err);
-      });
-    }
-  });
-
-  // Inicializar SO si no existen
-  const systems = ['Windows', 'macOS', 'Linux'];
-  systems.forEach((os) => {
-    db.get('SELECT * FROM downloads_by_os WHERE os = ?', [os], (err, row) => {
-      if (!row) {
-        db.run('INSERT INTO downloads_by_os (os, count) VALUES (?, 0)', [os], (err) => {
-          if (err) console.error(`❌ Error insertando ${os}:`, err);
-        });
-      }
+// GET /downloads/stats  — public, desglose por SO
+app.get('/downloads/stats', async (req, res) => {
+  try {
+    const store = await storage();
+    const [total, win, mac, linux] = await Promise.all([
+      store.get('downloads:total'),
+      store.get('downloads:os:Windows'),
+      store.get('downloads:os:macOS'),
+      store.get('downloads:os:Linux'),
+    ]);
+    res.json({
+      total: Number(total ?? 0),
+      windows: Number(win ?? 0),
+      macos: Number(mac ?? 0),
+      linux: Number(linux ?? 0),
     });
-  });
-}
-
-// GET /downloads - obtener contador actual
-app.get('/downloads', (req, res) => {
-  db.get('SELECT total FROM downloads WHERE id = 1', (err, row) => {
-    if (err) {
-      console.error('❌ Error en GET /downloads:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    res.json({ total: row?.total || 0 });
-  });
+  } catch (err) {
+    console.error('[GET /downloads/stats]', err);
+    res.status(500).json({ error: 'Error de almacenamiento' });
+  }
 });
 
-// GET /downloads/stats - obtener desglose por SO (con offset)
-app.get('/downloads/stats', (req, res) => {
-  db.all('SELECT os, count, offset FROM downloads_by_os ORDER BY (count + offset) DESC', (err, rows) => {
-    if (err) {
-      console.error('❌ Error en GET /downloads/stats:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-
-    db.get('SELECT total FROM downloads WHERE id = 1', (err, totalRow) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-
-      const stats = {};
-      let totalFromStats = 0;
-      (rows || []).forEach((row) => {
-        const total = row.count + row.offset;
-        stats[row.os.toLowerCase()] = total;
-        totalFromStats += total;
-      });
-
-      res.json({
-        total: totalRow?.total || 0,
-        windows: stats.windows || 0,
-        macos: stats.macos || 0,
-        linux: stats.linux || 0,
-        totalByOS: totalFromStats,
-        stats: stats,
-      });
-    });
-  });
+// POST /downloads/increment  — protegido, se llama al hacer click en descargar
+app.post('/downloads/increment', async (req, res) => {
+  const { os } = req.body || {};
+  try {
+    const store = await storage();
+    const total = await store.incr('downloads:total');
+    if (os) await store.incr(`downloads:os:${os}`);
+    console.log(`[INCREMENT] os=${os ?? 'unknown'} → total=${total}`);
+    res.json({ total, os: os || null });
+  } catch (err) {
+    console.error('[POST /downloads/increment]', err);
+    res.status(500).json({ error: 'Error de almacenamiento' });
+  }
 });
 
-// POST /downloads/stats/init - inicializar offsets por SO
-app.post('/downloads/stats/init', verifyAuth, (req, res) => {
-  const { windows = 0, macos = 0, linux = 0 } = req.body;
-
-  console.log(`[INIT STATS] Windows: ${windows}, macOS: ${macos}, Linux: ${linux}`);
-
-  // Actualizar offsets (se guardan permanentemente en SQLite)
-  db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [windows, 'Windows'], (err) => {
-    if (err) {
-      console.error('❌ Error actualizando Windows offset:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-
-    db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [macos, 'macOS'], (err) => {
-      if (err) {
-        console.error('❌ Error actualizando macOS offset:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      db.run('UPDATE downloads_by_os SET offset = ? WHERE os = ?', [linux, 'Linux'], (err) => {
-        if (err) {
-          console.error('❌ Error actualizando Linux offset:', err);
-          return res.status(500).json({ error: 'Database error' });
-        }
-
-        console.log(`✅ Offsets inicializados: Windows=${windows}, macOS=${macos}, Linux=${linux}`);
-        res.json({
-          message: 'Offsets initialized',
-          windows,
-          macos,
-          linux,
-        });
-      });
-    });
-  });
-});
-
-// POST /downloads/increment - sumar 1 (con estadísticas por SO)
-app.post('/downloads/increment', verifyAuth, (req, res) => {
-  const { os } = req.body;
-  const osLabel = os || 'Unknown';
-
-  // Actualizar total global
-  db.run('UPDATE downloads SET total = total + 1 WHERE id = 1', (err) => {
-    if (err) {
-      console.error('❌ Error en POST /downloads/increment:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-
-    // Actualizar conteo por SO
-    db.run('UPDATE downloads_by_os SET count = count + 1 WHERE os = ?', [osLabel], (err) => {
-      if (err) {
-        console.error('❌ Error actualizando SO:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      // Obtener totales actualizados
-      db.get('SELECT total FROM downloads WHERE id = 1', (err, row) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        console.log(`✅ Incrementado: ${row.total} (${osLabel}) desde ${req.headers['origin']}`);
-        res.json({ total: row.total, os: osLabel });
-      });
-    });
-  });
-});
-
-// POST /downloads/set - establecer valor (para inicializar con historial)
-app.post('/downloads/set', verifyAuth, (req, res) => {
-  const { total } = req.body;
+// POST /downloads/set  — protegido, permite ajustar el total inicial (migración)
+app.post('/downloads/set', async (req, res) => {
+  const { total } = req.body || {};
   if (typeof total !== 'number' || total < 0) {
-    return res.status(400).json({ error: 'Total debe ser un número >= 0' });
+    return res.status(400).json({ error: 'total debe ser un número >= 0' });
   }
-  db.run('UPDATE downloads SET total = ? WHERE id = 1', [total], (err) => {
-    if (err) {
-      console.error('❌ Error en POST /downloads/set:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    console.log(`✅ Establecido a: ${total} (desde ${req.headers['origin']})`);
+  try {
+    const store = await storage();
+    await store.set('downloads:total', total);
+    console.log(`[SET] total ajustado a ${total}`);
     res.json({ total });
-  });
-});
-
-// POST /downloads/add - sumar N descargas
-app.post('/downloads/add', verifyAuth, (req, res) => {
-  const { amount } = req.body;
-  if (typeof amount !== 'number' || amount < 0) {
-    return res.status(400).json({ error: 'Amount debe ser un número >= 0' });
+  } catch (err) {
+    console.error('[POST /downloads/set]', err);
+    res.status(500).json({ error: 'Error de almacenamiento' });
   }
-  db.run('UPDATE downloads SET total = total + ? WHERE id = 1', [amount], (err) => {
-    if (err) {
-      console.error('❌ Error en POST /downloads/add:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    db.get('SELECT total FROM downloads WHERE id = 1', (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      console.log(`✅ Añadidos ${amount}: total = ${row.total} (desde ${req.headers['origin']})`);
-      res.json({ total: row.total });
-    });
-  });
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// Server
 app.listen(PORT, () => {
-  console.log(`
-╔═════════════════════════════════════════════════════╗
-║  Kayser Downloads Backend - PROTEGIDO              ║
-╠═════════════════════════════════════════════════════╣
-║  🚀 Servidor en http://localhost:${PORT}                ║
-║                                                     ║
-║  ✅ GET   /downloads          → PÚBLICO (solo lectura) ║
-║  🔒 POST  /downloads/increment → PRIVADO (requiere auth) ║
-║  🔒 POST  /downloads/set      → PRIVADO (requiere auth) ║
-║  🔒 POST  /downloads/add      → PRIVADO (requiere auth) ║
-║  ✅ GET   /health             → PÚBLICO             ║
-║                                                     ║
-║  🔐 Seguridad:                                      ║
-║  • CORS: ${ALLOWED_ORIGIN}              ║
-║  • API Key: ${API_SECRET.substring(0, 15)}...        ║
-║                                                     ║
-║  POST requiere headers:                             ║
-║  - Origin: ${ALLOWED_ORIGIN}              ║
-║  - X-API-Key: [API_SECRET]                          ║
-╚═════════════════════════════════════════════════════╝
-  `);
+  console.log(`🚀 Backend corriendo en puerto ${PORT} | storage: ${hasKV ? 'Vercel KV' : 'in-memory'}`);
 });
