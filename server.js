@@ -10,23 +10,29 @@ app.use(cors());
 app.use(express.json());
 
 // ── Storage ───────────────────────────────────────────────────────────────────
-// Uses Vercel KV (Redis) in production; falls back to in-memory for local dev.
-const hasKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+// Uses Upstash Redis in production (via UPSTASH_REDIS_REST_URL / _TOKEN env vars
+// set automatically by Vercel's Upstash integration).
+// Falls back to in-memory Map for local dev when those vars are absent.
+const hasRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
 let _store = null;
 
 async function storage() {
   if (_store) return _store;
 
-  if (hasKV) {
-    const { kv } = await import('@vercel/kv');
+  if (hasRedis) {
+    const { Redis } = await import('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
     _store = {
-      get: (k) => kv.get(k),
-      incr: (k) => kv.incr(k),
-      set: (k, v) => kv.set(k, v),
+      get: (k) => redis.get(k),
+      incr: (k) => redis.incr(k),
+      set: (k, v) => redis.set(k, v),
     };
-    console.log('✅ Usando Vercel KV (Redis)');
+    console.log('✅ Usando Upstash Redis');
   } else {
-    console.warn('⚠ KV_REST_API_URL/KV_REST_API_TOKEN no definidos — usando almacenamiento en memoria (los datos se pierden al reiniciar)');
+    console.warn('⚠ UPSTASH_REDIS_REST_URL/TOKEN no definidos — usando almacenamiento en memoria (los datos se pierden al reiniciar)');
     const mem = new Map();
     _store = {
       get: async (k) => mem.get(k) ?? 0,
@@ -69,7 +75,7 @@ app.use(verifyAuth);
 
 // GET /health  — public
 app.get('/health', async (_req, res) => {
-  res.json({ status: 'ok', storage: hasKV ? 'vercel-kv' : 'in-memory' });
+  res.json({ status: 'ok', storage: hasRedis ? 'upstash-redis' : 'in-memory' });
 });
 
 // GET /downloads  — public, devuelve total acumulado
@@ -139,5 +145,5 @@ app.post('/downloads/set', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend corriendo en puerto ${PORT} | storage: ${hasKV ? 'Vercel KV' : 'in-memory'}`);
+  console.log(`🚀 Backend corriendo en puerto ${PORT} | storage: ${hasRedis ? 'Upstash Redis' : 'in-memory'}`);
 });
