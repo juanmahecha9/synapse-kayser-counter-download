@@ -1,54 +1,39 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://kayser-fawn.vercel.app';
 const API_SECRET = process.env.API_SECRET || 'kayser-downloads-secret-2024';
+const OFFSET = 79; // descargas históricas acumuladas
 
+// ── Supabase / PostgreSQL ─────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.SUPABASE_URl,
+  ssl: { rejectUnauthorized: false },
+});
+
+pool.on('error', (err) => {
+  console.error('[DB] Error inesperado en el pool:', err.message);
+});
+
+async function query(sql, params = []) {
+  const client = await pool.connect();
+  try {
+    return await client.query(sql, params);
+  } finally {
+    client.release();
+  }
+}
+
+// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ── Storage ───────────────────────────────────────────────────────────────────
-// Uses Upstash Redis in production (via UPSTASH_REDIS_REST_URL / _TOKEN env vars
-// set automatically by Vercel's Upstash integration).
-// Falls back to in-memory Map for local dev when those vars are absent.
-const hasRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
-let _store = null;
-
-async function storage() {
-  if (_store) return _store;
-
-  if (hasRedis) {
-    const { Redis } = await import('@upstash/redis');
-    const redis = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
-    _store = {
-      get: (k) => redis.get(k),
-      incr: (k) => redis.incr(k),
-      set: (k, v) => redis.set(k, v),
-    };
-    console.log('✅ Usando Upstash Redis');
-  } else {
-    console.warn('⚠ UPSTASH_REDIS_REST_URL/TOKEN no definidos — usando almacenamiento en memoria (los datos se pierden al reiniciar)');
-    const mem = new Map();
-    _store = {
-      get: async (k) => mem.get(k) ?? 0,
-      incr: async (k) => {
-        const v = (mem.get(k) ?? 0) + 1;
-        mem.set(k, v);
-        return v;
-      },
-      set: async (k, v) => { mem.set(k, v); },
-    };
-  }
-
-  return _store;
-}
-
-// ── Auth middleware ────────────────────────────────────────────────────────────
 function verifyAuth(req, res, next) {
   if (req.method === 'GET') return next();
 
@@ -73,77 +58,86 @@ app.use(verifyAuth);
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 
-// GET /health  — public
-app.get('/health', async (_req, res) => {
-  res.json({ status: 'ok', storage: hasRedis ? 'upstash-redis' : 'in-memory' });
+// GET /health
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', storage: 'supabase-postgres' });
 });
 
-// GET /downloads  — public, devuelve total acumulado
-app.get('/downloads', async (req, res) => {
+// GET /downloads — devuelve total: windows + linux + macos + offset
+app.get('/downloads', async (_req, res) => {
   try {
-    const store = await storage();
-    const total = (await store.get('downloads:total')) ?? 0;
-    res.json({ total: Number(total) });
-  } catch (err) {
-    console.error('[GET /downloads]', err);
-    res.status(500).json({ error: 'Error de almacenamiento' });
-  }
-});
-
-// GET /downloads/stats  — public, desglose por SO
-app.get('/downloads/stats', async (req, res) => {
-  try {
-    const store = await storage();
-    const [total, win, mac, linux] = await Promise.all([
-      store.get('downloads:total'),
-      store.get('downloads:os:Windows'),
-      store.get('downloads:os:macOS'),
-      store.get('downloads:os:Linux'),
-    ]);
-    res.json({
-      total: Number(total ?? 0),
-      windows: Number(win ?? 0),
-      macos: Number(mac ?? 0),
-      linux: Number(linux ?? 0),
-    });
-  } catch (err) {
-    console.error('[GET /downloads/stats]', err);
-    res.status(500).json({ error: 'Error de almacenamiento' });
-  }
-});
-
-// POST /downloads/increment  — protegido, se llama al hacer click en descargar
-app.post('/downloads/increment', async (req, res) => {
-  const { os } = req.body || {};
-  try {
-    const store = await storage();
-    const total = await store.incr('downloads:total');
-    if (os) await store.incr(`downloads:os:${os}`);
-    console.log(`[INCREMENT] os=${os ?? 'unknown'} → total=${total}`);
-    res.json({ total, os: os || null });
-  } catch (err) {
-    console.error('[POST /downloads/increment]', err);
-    res.status(500).json({ error: 'Error de almacenamiento' });
-  }
-});
-
-// POST /downloads/set  — protegido, permite ajustar el total inicial (migración)
-app.post('/downloads/set', async (req, res) => {
-  const { total } = req.body || {};
-  if (typeof total !== 'number' || total < 0) {
-    return res.status(400).json({ error: 'total debe ser un número >= 0' });
-  }
-  try {
-    const store = await storage();
-    await store.set('downloads:total', total);
-    console.log(`[SET] total ajustado a ${total}`);
+    const result = await query(`
+      SELECT COALESCE(SUM(count), 0)::int AS total
+      FROM downloads
+    `);
+    const total = Number(result.rows[0].total) + OFFSET;
     res.json({ total });
   } catch (err) {
-    console.error('[POST /downloads/set]', err);
-    res.status(500).json({ error: 'Error de almacenamiento' });
+    console.error('[GET /downloads]', err.message);
+    res.status(500).json({ error: 'Error de base de datos' });
   }
 });
 
+// GET /downloads/stats — desglose por plataforma
+app.get('/downloads/stats', async (_req, res) => {
+  try {
+    const result = await query(`
+      SELECT platform, count
+      FROM downloads
+      WHERE platform IN ('windows', 'linux', 'macos')
+    `);
+    const rows = result.rows;
+    const get = (p) => Number(rows.find((r) => r.platform === p)?.count ?? 0);
+    const windows = get('windows');
+    const linux   = get('linux');
+    const macos   = get('macos');
+    const total   = windows + linux + macos + OFFSET;
+    res.json({ total, windows, linux, macos });
+  } catch (err) {
+    console.error('[GET /downloads/stats]', err.message);
+    res.status(500).json({ error: 'Error de base de datos' });
+  }
+});
+
+// POST /downloads/increment — upsert: crea con count=1 o suma 1
+app.post('/downloads/increment', async (req, res) => {
+  const { os } = req.body || {};
+  const platform = normalizePlatform(os);
+
+  try {
+    if (platform) {
+      await query(`
+        INSERT INTO downloads (platform, count)
+        VALUES ($1, 1)
+        ON CONFLICT (platform)
+        DO UPDATE SET count = downloads.count + 1
+      `, [platform]);
+    }
+
+    const result = await query(`
+      SELECT COALESCE(SUM(count), 0)::int AS total FROM downloads
+    `);
+    const total = Number(result.rows[0].total) + OFFSET;
+
+    console.log(`[INCREMENT] platform=${platform ?? 'unknown'} → total=${total}`);
+    res.json({ total, platform: platform || null });
+  } catch (err) {
+    console.error('[POST /downloads/increment]', err.message);
+    res.status(500).json({ error: 'Error de base de datos' });
+  }
+});
+
+// ── Helper: normaliza el nombre del SO al formato de la tabla ─────────────────
+function normalizePlatform(os) {
+  if (!os) return null;
+  const s = String(os).toLowerCase();
+  if (s.includes('win'))   return 'windows';
+  if (s.includes('mac') || s.includes('osx') || s.includes('darwin')) return 'macos';
+  if (s.includes('lin'))   return 'linux';
+  return null;
+}
+
+// ── Arrancar ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🚀 Backend corriendo en puerto ${PORT} | storage: ${hasRedis ? 'Upstash Redis' : 'in-memory'}`);
+  console.log(`🚀 Backend corriendo en puerto ${PORT} | Supabase PostgreSQL`);
 });
