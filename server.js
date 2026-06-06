@@ -99,6 +99,20 @@ app.get('/downloads/stats', async (_req, res) => {
   }
 });
 
+// GET /releases — devuelve type y url_release de cada plataforma
+app.get('/releases', async (_req, res) => {
+  try {
+    const result = await query(`
+      SELECT type, url_release
+      FROM releases
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[GET /releases]', err.message);
+    res.status(500).json({ error: 'Error de base de datos' });
+  }
+});
+
 // POST /downloads/increment — upsert: crea con count=1 o suma 1
 app.post('/downloads/increment', async (req, res) => {
   const { os } = req.body || {};
